@@ -6,3 +6,5 @@ local_genre_db_pending.jsonl
 taxonomy_path.txt
 taxonomy_json_path.txt
 __pycache__/
+.pytest_cache/
+.ruff_cache/

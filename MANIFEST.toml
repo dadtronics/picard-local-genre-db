@@ -2,19 +2,18 @@ uuid = "ec8d05fd-2dc3-430a-a995-bb0b9b076b02"
 name = "Local Genre DB"
 description = "Apply canonical genre/style tags from a local taxonomy database (taxonomy.db or taxonomy.json snapshot)."
 api = ["3.0"]
-version = "0.4.2"
+version = "0.5.0"
 authors = ["aaron"]
-license = "MIT"
-license_url = "https://opensource.org/licenses/MIT"
+license = "GPL-2.0-or-later"
+license_url = "https://www.gnu.org/licenses/old-licenses/gpl-2.0.html"
+homepage = "https://github.com/dadtronics/picard-local-genre-db"
 long_description = """
-Reads a local genre/style taxonomy and applies canonical Genre and Grouping
-tags in MusicBrainz Picard.
+Reads a local genre/style taxonomy built with picard-genre-db and applies
+canonical Genre and Grouping tags in MusicBrainz Picard.
 
-- Reads taxonomy.db directly when the bundled Python has sqlite3, otherwise
-  falls back to taxonomy.json.
-- Paths are configured via taxonomy_path.txt and taxonomy_json_path.txt,
-  read from the plugin folder or, failing that, the Plugins folder above it
-  (the safe spot: it survives plugin updates).
-- Explicit decisions overwrite Picard metadata; alias mappings fill blanks.
+- Point it at your taxonomy.db in Options -> Plugins -> Local Genre DB.
+- Decisions (per recording, release, release group or artist) overwrite
+  Picard's genres; alias mappings fill blanks.
+- Reads SQLite directly, with taxonomy.json as a fallback.
 """
 categories = ["metadata"]

@@ -1,38 +1,104 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 rb303
-# Local Genre DB - Picard 3.0 (plugin3/MANIFEST.toml) format.
-# See MANIFEST.toml in this folder for name/version/metadata.
+"""Local Genre DB - Picard 3 plugin.
+
+Applies canonical genre/style tags from a local taxonomy (taxonomy.db, or a
+taxonomy.json snapshot) built with https://github.com/dadtronics/picard-genre-db.
+
+This module only uses the standard library so the lookup logic can be tested
+without Picard. The Qt parts (settings page, context-menu action) live in
+``options.py`` and ``actions.py`` and are imported from ``enable()``.
+"""
 
 import json
+import logging
 import os
+from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Iterable, List, Optional, Set
 
-from picard import log
+# Plugin settings (stored in Picard's config under plugin.<uuid>) and defaults.
+DEFAULTS = {
+    'db_path': '',
+    'json_path': '',
+    'overwrite_existing': False,
+    'overwrite_with_decisions': True,
+    'write_style_tag': False,
+    'write_grouping_tag': True,
+    'remove_duplicate_style_tag': True,
+    'learn_from_metadata': True,
+    'learn_default_scope': 'artist',
+}
 
-TAXONOMY_DB_PATH = os.path.expanduser('~/taxonomy.db')
-TAXONOMY_JSON_PATH = os.path.expanduser('~/taxonomy.json')
-PREFER_SQLITE = True
-OVERWRITE_EXISTING = False
-OVERWRITE_WITH_DECISIONS = True
-WRITE_STYLE_TAG = False
-WRITE_GROUPING_TAG = True
-REMOVE_DUPLICATE_STYLE_TAG = True
-LEARN_FROM_METADATA = True
-LEARN_DEFAULT_SCOPE = 'artist'
+LEARN_SCOPES = ('artist', 'release_group', 'release', 'recording')
 
+DECISION_TABLES = {
+    # scope: (table, id column, snapshot key)
+    'recording': ('recording_decision', 'recording_mbid', 'recording_decisions'),
+    'release': ('release_decision', 'release_mbid', 'release_decisions'),
+    'release_group': ('release_group_decision', 'release_group_mbid', 'release_group_decisions'),
+    'artist': ('artist_decision', 'artist_mbid', 'artist_decisions'),
+}
+
+# Replaced with Picard's plugin logger in enable(); messages then show up in
+# Help -> View Debug/Error Log.
+log = logging.getLogger('local_genre_db')
+
+
+@dataclass
+class Settings:
+    db_path: str = ''
+    json_path: str = ''
+    overwrite_existing: bool = False
+    overwrite_with_decisions: bool = True
+    write_style_tag: bool = False
+    write_grouping_tag: bool = True
+    remove_duplicate_style_tag: bool = True
+    learn_from_metadata: bool = True
+    learn_default_scope: str = 'artist'
+
+    @classmethod
+    def from_config(cls, config) -> Settings:
+        values = {}
+        for name, default in DEFAULTS.items():
+            try:
+                value = config[name]
+            except Exception:
+                value = default
+            if isinstance(default, bool):
+                value = _to_bool(value, default)
+            elif value is None:
+                value = default
+            else:
+                value = str(value)
+            values[name] = value
+        return cls(**values)
+
+
+def _to_bool(value, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().casefold()
+        if lowered in ('true', '1', 'yes', 'on'):
+            return True
+        if lowered in ('false', '0', 'no', 'off'):
+            return False
+    if isinstance(value, int):
+        return bool(value)
+    return default
+
+
+# --------------------------------------------------------------------------
+# Locating the taxonomy
+# --------------------------------------------------------------------------
 
 def _plugin_dir() -> str:
-    plugin_dir = os.path.dirname(__file__)
-    zip_marker = '.zip'
-    if zip_marker in plugin_dir.casefold():
-        zip_index = plugin_dir.casefold().index(zip_marker) + len(zip_marker)
-        plugin_dir = os.path.dirname(plugin_dir[:zip_index])
-    return plugin_dir
+    return os.path.dirname(os.path.abspath(__file__))
 
 
 def _data_dir() -> str:
-    """Folder for files the plugin writes (log, pending decisions).
+    """Folder for files the plugin writes (pending decisions).
 
     The parent of the plugin folder (Picard's Plugins folder). Picard 3
     installs plugins as git checkouts and refuses to update or switch refs
@@ -41,164 +107,75 @@ def _data_dir() -> str:
     return os.path.dirname(_plugin_dir())
 
 
-def _append_file_log(message: str) -> None:
-    try:
-        log_path = os.path.join(_data_dir(), 'local_genre_db_load.log')
-        with open(log_path, 'a', encoding='utf-8') as handle:
-            handle.write(f'{datetime.now().isoformat(timespec="seconds")} {message}\n')
-    except Exception:
-        pass
-
-
-def _read_path_file(name: str) -> str:
-    """Return the first line of a path file, or ''.
-
-    Looks in the plugin folder first, then its parent (the Plugins folder).
-    The parent lets the path files survive reinstalls/updates from git, which
-    replace the plugin folder.
-    """
-    plugin_dir = _plugin_dir()
+def _read_path_file(name: str, plugin_dir: str) -> str:
+    """First line of a legacy pointer file, from the plugin folder or its parent."""
     for folder in (plugin_dir, os.path.dirname(plugin_dir)):
         try:
-            with open(os.path.join(folder, name), 'r', encoding='utf-8-sig') as config_file:
-                file_path = config_file.readline().strip().lstrip('\ufeff')
+            with open(os.path.join(folder, name), encoding='utf-8-sig') as handle:
+                value = handle.readline().strip().lstrip('﻿')
         except OSError:
             continue
-        if file_path:
-            return file_path
+        if value:
+            return value
     return ''
 
 
-def _taxonomy_json_path() -> str:
-    env_path = os.environ.get('PICARD_TAXONOMY_JSON', '').strip()
-    if env_path:
-        return os.path.expanduser(env_path)
+def resolve_path(kind: str, settings: Settings, plugin_dir: str | None = None):
+    """Return (path, source) for kind 'db' or 'json'.
 
-    file_path = _read_path_file('taxonomy_json_path.txt')
-    if file_path:
-        return os.path.expanduser(file_path)
+    Order: plugin settings, environment variable, legacy pointer file
+    (plugin folder, then its parent), then ~/taxonomy.db / ~/taxonomy.json.
+    """
+    plugin_dir = plugin_dir or _plugin_dir()
+    if kind == 'db':
+        configured, env_name, file_name, default = (
+            settings.db_path, 'PICARD_TAXONOMY_DB', 'taxonomy_path.txt', '~/taxonomy.db')
+    else:
+        configured, env_name, file_name, default = (
+            settings.json_path, 'PICARD_TAXONOMY_JSON', 'taxonomy_json_path.txt', '~/taxonomy.json')
 
-    return TAXONOMY_JSON_PATH
-
-
-def _taxonomy_db_path() -> str:
-    env_path = os.environ.get('PICARD_TAXONOMY_DB', '').strip()
-    if env_path:
-        return os.path.expanduser(env_path)
-
-    file_path = _read_path_file('taxonomy_path.txt')
-    if file_path:
-        return os.path.expanduser(file_path)
-
-    return TAXONOMY_DB_PATH
-
-
-def _pending_path() -> str:
-    return os.path.join(_data_dir(), 'local_genre_db_pending.jsonl')
+    if configured.strip():
+        return os.path.expanduser(configured.strip()), 'settings'
+    env_value = os.environ.get(env_name, '').strip()
+    if env_value:
+        return os.path.expanduser(env_value), f'env {env_name}'
+    file_value = _read_path_file(file_name, plugin_dir)
+    if file_value:
+        return os.path.expanduser(file_value), f'pointer file {file_name}'
+    return os.path.expanduser(default), 'default'
 
 
-def _preferred_scope(metadata) -> str:
-    value = _get_tag(metadata, 'local_genre_db_scope', '').strip().casefold()
-    if value in ('artist', 'album', 'release', 'release_group', 'release-group', 'track', 'recording'):
-        return value
-    return LEARN_DEFAULT_SCOPE
+# --------------------------------------------------------------------------
+# Loading the taxonomy
+# --------------------------------------------------------------------------
 
+def load_snapshot(settings: Settings, plugin_dir: str | None = None):
+    """Load decisions and aliases. Prefers SQLite, falls back to JSON.
 
-def _pending_target(
-    metadata,
-    recording_mbid: str,
-    release_mbid: str,
-    release_group_mbid: str,
-    album_artist_mbids: Iterable[str],
-    track_artist_mbids: Iterable[str],
-):
-    scope = _preferred_scope(metadata)
-    if scope == 'artist':
-        mbids = list(album_artist_mbids) or list(track_artist_mbids)
-        if mbids:
-            return 'artist', mbids[0]
-    if scope in ('album', 'release') and release_mbid:
-        return 'release', release_mbid
-    if scope in ('release_group', 'release-group') and release_group_mbid:
-        return 'release_group', release_group_mbid
-    if scope in ('track', 'recording') and recording_mbid:
-        return 'recording', recording_mbid
-    return '', ''
-
-
-def _append_pending_decision(
-    metadata,
-    recording_mbid: str,
-    release_mbid: str,
-    release_group_mbid: str,
-    album_artist_mbids: Iterable[str],
-    track_artist_mbids: Iterable[str],
-) -> None:
-    if not LEARN_FROM_METADATA:
-        return
-    genre = _get_tag(metadata, 'genre', '').strip()
-    styles = (
-        _get_tag(metadata, 'grouping', '').strip() or
-        _get_tag(metadata, 'contentgroup', '').strip() or
-        _get_tag(metadata, 'style', '').strip()
-    )
-    if not genre or not styles:
-        return
-    scope, mbid = _pending_target(
-        metadata,
-        recording_mbid,
-        release_mbid,
-        release_group_mbid,
-        album_artist_mbids,
-        track_artist_mbids,
-    )
-    if not scope or not mbid:
-        return
-    row = {
-        'scope': scope,
-        'mbid': mbid,
-        'genre': genre,
-        'styles': styles,
-        'title': _get_tag(metadata, 'title', ''),
-        'artist': _get_tag(metadata, 'artist', ''),
-        'album': _get_tag(metadata, 'album', ''),
-        'recording_mbid': recording_mbid,
-        'release_mbid': release_mbid,
-        'release_group_mbid': release_group_mbid,
-        'album_artist_mbids': list(album_artist_mbids),
-        'track_artist_mbids': list(track_artist_mbids),
-        'learned_at': datetime.now().isoformat(timespec='seconds'),
-    }
-    try:
-        with open(_pending_path(), 'a', encoding='utf-8') as handle:
-            handle.write(json.dumps(row, sort_keys=True) + '\n')
-        _append_file_log(f'pending scope={scope!r} mbid={mbid!r} genre={genre!r} styles={styles!r}')
-    except Exception as exc:
-        _append_file_log(f'pending_error={exc!r}')
-
-
-def _load_snapshot():
-    db_path = _taxonomy_db_path()
-    if PREFER_SQLITE and db_path and os.path.exists(db_path):
+    Re-read on every call on purpose: it takes about a millisecond and means
+    edits in the web app apply on the next album refresh, no restart needed.
+    """
+    db_path, _ = resolve_path('db', settings, plugin_dir)
+    if db_path and os.path.exists(db_path):
         try:
-            return _load_sqlite_snapshot(db_path)
-        except ImportError as exc:
-            _append_file_log(f'sqlite_unavailable={exc!r}')
+            return load_sqlite_snapshot(db_path)
         except Exception as exc:
-            _append_file_log(f'sqlite_snapshot_error={exc!r}')
-
-    json_path = _taxonomy_json_path()
-    with open(json_path, 'r', encoding='utf-8-sig') as handle:
+            log.warning('Local Genre DB: could not read %s (%s); trying JSON', db_path, exc)
+    json_path, _ = resolve_path('json', settings, plugin_dir)
+    with open(json_path, encoding='utf-8-sig') as handle:
         return json.load(handle)
 
 
-def _load_sqlite_snapshot(db_path: str):
+def load_sqlite_snapshot(db_path: str):
     import sqlite3
+    from pathlib import Path
 
-    con = sqlite3.connect(db_path)
+    # Read-only, so lookups never lock out the web app.
+    con = sqlite3.connect(Path(db_path).resolve().as_uri() + '?mode=ro', uri=True)
     con.row_factory = sqlite3.Row
     try:
-        def decision_rows(table: str, id_column: str):
+        snapshot = {}
+        for table, id_column, key in DECISION_TABLES.values():
             rows = con.execute(
                 f'''
                 SELECT
@@ -211,15 +188,13 @@ def _load_sqlite_snapshot(db_path: str):
                    OR COALESCE(d.styles_text, '') != ''
                 '''
             ).fetchall()
-            return {
-                str(row['mbid']): {
-                    'genre': str(row['genre'] or ''),
-                    'styles': str(row['styles'] or ''),
-                }
+            snapshot[key] = {
+                str(row['mbid']): {'genre': str(row['genre'] or ''), 'styles': str(row['styles'] or '')}
                 for row in rows
             }
 
-        alias_rows = con.execute(
+        aliases = {}
+        for row in con.execute(
             '''
             SELECT am.raw_value, cg.name AS genre, cs.name AS style
             FROM alias_mapping am
@@ -227,26 +202,44 @@ def _load_sqlite_snapshot(db_path: str):
             LEFT JOIN canonical_style cs ON cs.id = am.normalized_style_id
             ORDER BY am.confidence DESC, am.id ASC
             '''
-        ).fetchall()
-        aliases = {}
-        for row in alias_rows:
-            key = str(row['raw_value'] or '').casefold()
-            if key and key not in aliases:
-                aliases[key] = {
-                    'genre': str(row['genre'] or ''),
-                    'style': str(row['style'] or ''),
-                }
-
-        return {
-            'artist_decisions': decision_rows('artist_decision', 'artist_mbid'),
-            'release_decisions': decision_rows('release_decision', 'release_mbid'),
-            'release_group_decisions': decision_rows('release_group_decision', 'release_group_mbid'),
-            'recording_decisions': decision_rows('recording_decision', 'recording_mbid'),
-            'aliases': aliases,
-        }
+        ):
+            raw_key = str(row['raw_value'] or '').casefold()
+            if raw_key and raw_key not in aliases:
+                aliases[raw_key] = {'genre': str(row['genre'] or ''), 'style': str(row['style'] or '')}
+        snapshot['aliases'] = aliases
+        return snapshot
     finally:
         con.close()
 
+
+def describe_taxonomy(settings: Settings, plugin_dir: str | None = None) -> str:
+    """One-line status for the settings page and the startup log."""
+    db_path, db_source = resolve_path('db', settings, plugin_dir)
+    json_path, json_source = resolve_path('json', settings, plugin_dir)
+    if not os.path.exists(db_path) and not os.path.exists(json_path):
+        return f'Not found: {db_path} ({db_source}) or {json_path} ({json_source})'
+    try:
+        snapshot = load_snapshot(settings, plugin_dir)
+    except Exception as exc:
+        return f'Error reading taxonomy: {exc}'
+    used = db_path if os.path.exists(db_path) else json_path
+    source = db_source if os.path.exists(db_path) else json_source
+    counts = ', '.join(
+        f'{len(snapshot.get(key, {}))} {label}'
+        for key, label in (
+            ('release_group_decisions', 'release groups'),
+            ('release_decisions', 'releases'),
+            ('recording_decisions', 'recordings'),
+            ('artist_decisions', 'artists'),
+            ('aliases', 'aliases'),
+        )
+    )
+    return f'Using {used} ({source}): {counts}'
+
+
+# --------------------------------------------------------------------------
+# Tag helpers
+# --------------------------------------------------------------------------
 
 def _get_tag(metadata, name: str, default: str = '') -> str:
     try:
@@ -263,8 +256,14 @@ def _get_tag(metadata, name: str, default: str = '') -> str:
     return str(value)
 
 
+def split_semicolon(value: str) -> list[str]:
+    if not value:
+        return []
+    return [part.strip() for part in value.split(';') if part.strip()]
+
+
 def _set_tag(metadata, name: str, value: str) -> None:
-    values = _split_semicolon(value)
+    values = split_semicolon(value)
     metadata[name] = values if values else value
 
 
@@ -278,247 +277,224 @@ def _delete_tag(metadata, name: str) -> bool:
     return False
 
 
-def _should_write(metadata, tag_name: str, force: bool = False) -> bool:
-    current = _get_tag(metadata, tag_name, '')
-    return force or OVERWRITE_EXISTING or not current.strip()
-
-
-def _same_semicolon_values(left: str, right: str) -> bool:
-    return _split_semicolon(left) == _split_semicolon(right)
-
-
-def _split_semicolon(value: str) -> List[str]:
+def _split_ids(value: str) -> list[str]:
     if not value:
         return []
-    return [part.strip() for part in value.split(';') if part.strip()]
+    return [part.strip() for part in value.replace(';', ',').split(',') if part.strip()]
 
 
-def _split_ids(value: str) -> List[str]:
-    if not value:
-        return []
-    normalized = value.replace(';', ',')
-    return [part.strip() for part in normalized.split(',') if part.strip()]
+def metadata_ids(metadata) -> dict:
+    return {
+        'recording': _get_tag(metadata, 'musicbrainz_recordingid').strip(),
+        # Picard calls the release MBID "albumid".
+        'release': _get_tag(metadata, 'musicbrainz_albumid').strip(),
+        'release_group': _get_tag(metadata, 'musicbrainz_releasegroupid').strip(),
+        'album_artists': (
+            _split_ids(_get_tag(metadata, 'musicbrainz_albumartistid')) or
+            _split_ids(_get_tag(metadata, 'musicbrainz_releaseartistid'))
+        ),
+        'track_artists': _split_ids(_get_tag(metadata, 'musicbrainz_artistid')),
+    }
 
 
-def _collect_raw_terms(metadata) -> List[str]:
-    terms: List[str] = []
-    for tag_name in ('genre', 'style', 'contentgroup', 'grouping'):
-        terms.extend(_split_semicolon(_get_tag(metadata, tag_name, '')))
-    seen: Set[str] = set()
-    ordered: List[str] = []
-    for term in terms:
-        key = term.casefold()
-        if key not in seen:
-            seen.add(key)
-            ordered.append(term)
-    return ordered
+def current_styles(metadata) -> str:
+    return (
+        _get_tag(metadata, 'grouping').strip() or
+        _get_tag(metadata, 'contentgroup').strip() or
+        _get_tag(metadata, 'style').strip()
+    )
 
 
-def _lookup_artist_decision(snapshot, artist_mbids: Iterable[str]):
-    artist_decisions = snapshot.get('artist_decisions', {})
-    for artist_mbid in artist_mbids:
-        decision = artist_decisions.get(artist_mbid)
+# --------------------------------------------------------------------------
+# Lookup and apply
+# --------------------------------------------------------------------------
+
+def lookup_decision(snapshot, ids: dict):
+    """Most specific decision wins: recording, release, release group, artist."""
+    for scope in ('recording', 'release', 'release_group'):
+        mbid = ids.get(scope)
+        if not mbid:
+            continue
+        decision = snapshot.get(DECISION_TABLES[scope][2], {}).get(mbid)
         if decision:
-            result = dict(decision)
-            result['source'] = 'artist'
-            result['source_mbid'] = artist_mbid
-            return result
+            return dict(decision, source=scope, source_mbid=mbid)
+    artist_decisions = snapshot.get('artist_decisions', {})
+    for mbid in list(ids.get('album_artists', [])) + list(ids.get('track_artists', [])):
+        decision = artist_decisions.get(mbid)
+        if decision:
+            return dict(decision, source='artist', source_mbid=mbid)
     return None
 
 
-def _lookup_decision(
-    snapshot,
-    recording_mbid: str,
-    release_mbid: str,
-    release_group_mbid: str,
-    album_artist_mbids: Iterable[str],
-    track_artist_mbids: Iterable[str],
-):
-    lookups = (
-        ('recording', 'recording_decisions', recording_mbid),
-        ('release', 'release_decisions', release_mbid),
-        ('release_group', 'release_group_decisions', release_group_mbid),
-    )
-    for source, key, mbid in lookups:
-        if not mbid:
-            continue
-        decision = snapshot.get(key, {}).get(mbid)
-        if decision:
-            result = dict(decision)
-            result['source'] = source
-            result['source_mbid'] = mbid
-            return result
-
-    return (
-        _lookup_artist_decision(snapshot, album_artist_mbids) or
-        _lookup_artist_decision(snapshot, track_artist_mbids)
-    )
-
-
-def _lookup_aliases(snapshot, raw_terms: Iterable[str]):
+def lookup_aliases(snapshot, raw_terms: Iterable[str]):
     aliases = snapshot.get('aliases', {})
-    genre_name: Optional[str] = None
-    styles: List[str] = []
-    seen_styles: Set[str] = set()
+    genre_name: str | None = None
+    styles: list[str] = []
+    seen: set[str] = set()
     for raw in raw_terms:
         row = aliases.get(raw.casefold())
         if not row:
             continue
         if row.get('genre') and not genre_name:
             genre_name = str(row['genre'])
-        if row.get('style'):
-            style = str(row['style'])
-            if style.casefold() not in seen_styles:
-                seen_styles.add(style.casefold())
-                styles.append(style)
+        style = str(row.get('style') or '')
+        if style and style.casefold() not in seen:
+            seen.add(style.casefold())
+            styles.append(style)
     if not genre_name and not styles:
         return None
     return {'genre': genre_name or '', 'styles': '; '.join(styles), 'source': 'alias', 'source_mbid': ''}
 
 
-def _apply_metadata(metadata, decision) -> dict:
+def _raw_terms(metadata) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for tag_name in ('genre', 'style', 'contentgroup', 'grouping'):
+        for term in split_semicolon(_get_tag(metadata, tag_name)):
+            if term.casefold() not in seen:
+                seen.add(term.casefold())
+                ordered.append(term)
+    return ordered
+
+
+def apply_decision(metadata, decision, settings: Settings) -> dict:
     genre = (decision.get('genre') or '').strip()
     styles = (decision.get('styles') or '').strip()
-    force = OVERWRITE_WITH_DECISIONS and decision.get('source') != 'alias'
-    result = {
+    force = settings.overwrite_with_decisions and decision.get('source') != 'alias'
+    written = []
+
+    def should_write(tag_name):
+        return force or settings.overwrite_existing or not _get_tag(metadata, tag_name).strip()
+
+    if genre and should_write('genre'):
+        _set_tag(metadata, 'genre', genre)
+        written.append('genre')
+    if settings.write_style_tag and styles and should_write('style'):
+        _set_tag(metadata, 'style', styles)
+        written.append('style')
+    if settings.write_grouping_tag and styles and should_write('grouping'):
+        _set_tag(metadata, 'grouping', styles)
+        written.append('grouping')
+    if (settings.remove_duplicate_style_tag and not settings.write_style_tag and styles and
+            split_semicolon(_get_tag(metadata, 'style')) == split_semicolon(styles)):
+        if _delete_tag(metadata, 'style'):
+            written.append('-style')
+    if styles and split_semicolon(_get_tag(metadata, 'contentgroup')) == split_semicolon(styles):
+        if _delete_tag(metadata, 'contentgroup'):
+            written.append('-contentgroup')
+    return {'genre': genre, 'styles': styles, 'written': written}
+
+
+# --------------------------------------------------------------------------
+# Learning (pending decisions for the web app to import)
+# --------------------------------------------------------------------------
+
+def _pending_path() -> str:
+    return os.path.join(_data_dir(), 'local_genre_db_pending.jsonl')
+
+
+def _learn_target(metadata, ids: dict, settings: Settings):
+    scope = _get_tag(metadata, 'local_genre_db_scope').strip().casefold() or settings.learn_default_scope
+    scope = {'album': 'release', 'release-group': 'release_group', 'track': 'recording'}.get(scope, scope)
+    if scope == 'artist':
+        artists = list(ids['album_artists']) or list(ids['track_artists'])
+        return ('artist', artists[0]) if artists else ('', '')
+    if scope in ('release', 'release_group', 'recording') and ids.get(scope):
+        return scope, ids[scope]
+    return '', ''
+
+
+def append_pending(metadata, ids: dict, settings: Settings, path: str | None = None) -> bool:
+    if not settings.learn_from_metadata:
+        return False
+    genre = _get_tag(metadata, 'genre').strip()
+    styles = current_styles(metadata)
+    if not genre or not styles:
+        return False
+    scope, mbid = _learn_target(metadata, ids, settings)
+    if not mbid:
+        return False
+    row = {
+        'scope': scope,
+        'mbid': mbid,
         'genre': genre,
         'styles': styles,
-        'force': force,
-        'wrote_genre': False,
-        'wrote_style': False,
-        'wrote_grouping': False,
-        'removed_style': False,
-        'removed_contentgroup': False,
+        'title': _get_tag(metadata, 'title'),
+        'artist': _get_tag(metadata, 'artist'),
+        'album': _get_tag(metadata, 'album'),
+        'recording_mbid': ids['recording'],
+        'release_mbid': ids['release'],
+        'release_group_mbid': ids['release_group'],
+        'album_artist_mbids': list(ids['album_artists']),
+        'track_artist_mbids': list(ids['track_artists']),
+        'learned_at': datetime.now().isoformat(timespec='seconds'),
     }
-
-    if genre and _should_write(metadata, 'genre', force):
-        _set_tag(metadata, 'genre', genre)
-        result['wrote_genre'] = True
-    if WRITE_STYLE_TAG and styles and _should_write(metadata, 'style', force):
-        _set_tag(metadata, 'style', styles)
-        result['wrote_style'] = True
-    if WRITE_GROUPING_TAG and styles and _should_write(metadata, 'grouping', force):
-        _set_tag(metadata, 'grouping', styles)
-        result['wrote_grouping'] = True
-    if (
-        REMOVE_DUPLICATE_STYLE_TAG and
-        not WRITE_STYLE_TAG and
-        styles and
-        _same_semicolon_values(_get_tag(metadata, 'style', ''), styles)
-    ):
-        result['removed_style'] = _delete_tag(metadata, 'style')
-    if styles and _same_semicolon_values(_get_tag(metadata, 'contentgroup', ''), styles):
-        result['removed_contentgroup'] = _delete_tag(metadata, 'contentgroup')
-    return result
-
-
-def _process_metadata(metadata, entity_type: str) -> None:
-    db_path = _taxonomy_db_path()
-    json_path = _taxonomy_json_path()
-    if not os.path.exists(db_path) and not os.path.exists(json_path):
-        _append_file_log(f'taxonomy_missing db_path={db_path!r} json_path={json_path!r}')
-        log.warning('Local Genre DB: taxonomy not found at %r or %r', db_path, json_path)
-        return
-
-    recording_mbid = _get_tag(metadata, 'musicbrainz_recordingid', '').strip()
-    release_mbid = _get_tag(metadata, 'musicbrainz_albumid', '').strip()
-    release_group_mbid = _get_tag(metadata, 'musicbrainz_releasegroupid', '').strip()
-    album_artist_mbids = (
-        _split_ids(_get_tag(metadata, 'musicbrainz_albumartistid', '')) or
-        _split_ids(_get_tag(metadata, 'musicbrainz_releaseartistid', ''))
-    )
-    track_artist_mbids = _split_ids(_get_tag(metadata, 'musicbrainz_artistid', ''))
-
     try:
-        snapshot = _load_snapshot()
-        decision = _lookup_decision(
-            snapshot,
-            recording_mbid,
-            release_mbid,
-            release_group_mbid,
-            album_artist_mbids,
-            track_artist_mbids,
-        )
-        if not decision:
-            decision = _lookup_aliases(snapshot, _collect_raw_terms(metadata))
-        if decision:
-            applied = _apply_metadata(metadata, decision)
-        else:
-            _append_pending_decision(
-                metadata,
-                recording_mbid,
-                release_mbid,
-                release_group_mbid,
-                album_artist_mbids,
-                track_artist_mbids,
-            )
-            applied = {}
-        _append_file_log(
-            'run '
-            f'entity={entity_type!r} title={_get_tag(metadata, "title", "")!r} '
-            f'artist={_get_tag(metadata, "artist", "")!r} '
-            f'recording_mbid={recording_mbid!r} '
-            f'release_mbid={release_mbid!r} '
-            f'release_group_mbid={release_group_mbid!r} '
-            f'album_artist_mbids={list(album_artist_mbids)!r} '
-            f'track_artist_mbids={list(track_artist_mbids)!r} '
-            f'source={(decision or {}).get("source", "")!r} '
-            f'mbid={(decision or {}).get("source_mbid", "")!r} '
-            f'genre={(applied or {}).get("genre", "")!r} '
-            f'styles={(applied or {}).get("styles", "")!r} '
-            f'force={int(bool((applied or {}).get("force")))} '
-            f'wrote_genre={int(bool((applied or {}).get("wrote_genre")))} '
-            f'wrote_style={int(bool((applied or {}).get("wrote_style")))} '
-            f'wrote_grouping={int(bool((applied or {}).get("wrote_grouping")))} '
-            f'removed_style={int(bool((applied or {}).get("removed_style")))} '
-            f'removed_contentgroup={int(bool((applied or {}).get("removed_contentgroup")))}'
-        )
+        with open(path or _pending_path(), 'a', encoding='utf-8') as handle:
+            handle.write(json.dumps(row, sort_keys=True) + '\n')
+    except OSError as exc:
+        log.warning('Local Genre DB: could not write pending decision: %s', exc)
+        return False
+    return True
+
+
+# --------------------------------------------------------------------------
+# Picard entry points
+# --------------------------------------------------------------------------
+
+def process_metadata(metadata, entity: str, settings: Settings, plugin_dir: str | None = None):
+    """Look up and apply a decision. Returns the decision applied, or None."""
+    db_path, _ = resolve_path('db', settings, plugin_dir)
+    json_path, _ = resolve_path('json', settings, plugin_dir)
+    if not os.path.exists(db_path) and not os.path.exists(json_path):
+        log.warning(
+            'Local Genre DB: taxonomy not found (%s / %s). Set it in '
+            'Options -> Plugins -> Local Genre DB.', db_path, json_path)
+        return None
+
+    ids = metadata_ids(metadata)
+    snapshot = load_snapshot(settings, plugin_dir)
+    decision = lookup_decision(snapshot, ids) or lookup_aliases(snapshot, _raw_terms(metadata))
+    if decision:
+        result = apply_decision(metadata, decision, settings)
+        log.debug(
+            'Local Genre DB: %s %r: %s %s -> genre=%r styles=%r wrote=%s',
+            entity, _get_tag(metadata, 'title') or _get_tag(metadata, 'album'),
+            decision['source'], decision.get('source_mbid', ''),
+            result['genre'], result['styles'], ','.join(result['written']) or 'nothing')
+        return decision
+    if append_pending(metadata, ids, settings):
+        log.debug('Local Genre DB: no decision for %r; saved as pending', _get_tag(metadata, 'album'))
+    return None
+
+
+def _process_album(api, album, metadata, release_node):
+    try:
+        process_metadata(metadata, 'release', Settings.from_config(api.plugin_config))
     except Exception as exc:
-        _append_file_log(f'processing_error={exc!r}')
         log.error('Local Genre DB: processing failed: %s', exc)
 
 
-def process_album(album, metadata, release_node):
-    _process_metadata(metadata, 'release')
-
-
-def process_track(track, metadata, track_node, release_node=None):
-    _process_metadata(metadata, 'recording')
-
-
-def _log_plugin_load() -> None:
-    _append_file_log('plugin import reached')
-    db_path = _taxonomy_db_path()
-    json_path = _taxonomy_json_path()
-    _append_file_log(f'db_path={db_path!r} exists={os.path.exists(db_path)}')
-    _append_file_log(f'json_path={json_path!r} exists={os.path.exists(json_path)}')
+def _process_track(api, track, metadata, track_node, release_node=None):
     try:
-        snapshot = _load_snapshot()
-        _append_file_log(
-            'snapshot_loaded '
-            f'artists={len(snapshot.get("artist_decisions", {}))} '
-            f'releases={len(snapshot.get("release_decisions", {}))} '
-            f'release_groups={len(snapshot.get("release_group_decisions", {}))} '
-            f'recordings={len(snapshot.get("recording_decisions", {}))} '
-            f'aliases={len(snapshot.get("aliases", {}))}'
-        )
+        process_metadata(metadata, 'recording', Settings.from_config(api.plugin_config))
     except Exception as exc:
-        _append_file_log(f'snapshot_load_error={exc!r}')
+        log.error('Local Genre DB: processing failed: %s', exc)
 
 
 def enable(api) -> None:
-    """Picard 3.0 entry point: register metadata processors."""
-    try:
-        from picard.metadata import album_metadata_processors, track_metadata_processors
-        album_metadata_processors.register(__name__, process_album)
-        track_metadata_processors.register(__name__, process_track)
-    except Exception as exc:
-        _append_file_log(f'register_error={exc!r}')
-        log.error('Local Genre DB: failed to register processors: %s', exc)
-        return
-    _append_file_log('enabled')
-    _log_plugin_load()
+    global log
+    log = api.logger
+    for name, default in DEFAULTS.items():
+        api.plugin_config.register_option(name, default)
+    api.register_album_metadata_processor(_process_album)
+    api.register_track_metadata_processor(_process_track)
+
+    from .options import LocalGenreDbOptionsPage
+    api.register_options_page(LocalGenreDbOptionsPage)
+
+    log.info('Local Genre DB: %s', describe_taxonomy(Settings.from_config(api.plugin_config)))
 
 
 def disable() -> None:
-    _append_file_log('disabled')
+    pass

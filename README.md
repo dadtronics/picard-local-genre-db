@@ -48,6 +48,11 @@ in Picard's Plugins folder.
 
 ## Using it
 
+- **Save a decision from Picard**: fix an album's Genre and Grouping in
+  Picard, right-click the album → **Save genre to Local Genre DB**, and pick
+  the scope (release group, this release, or album artist). Genres and styles
+  must already exist in the taxonomy (canonical names or aliases); anything
+  unknown is refused with a message, so add new ones in the web app first.
 - The plugin runs when a release loads. After changing a decision in the web
   app, right-click the album → **Refresh**. The database is re-read on every
   lookup, so no restart is needed.
@@ -74,7 +79,8 @@ QT_QPA_PLATFORM=offscreen pytest -q tests
 ```
 
 The core (`__init__.py`) is standard-library only and tested without Picard;
-`options.py` (settings page) is tested with real PyQt6, headless.
+`options.py` (settings page) is tested with real PyQt6, headless, and
+`actions.py` (right-click action) with a fake Picard.
 To release: bump `version` in `MANIFEST.toml`, commit, then
 `git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`. CI checks that the
 tag matches the manifest.

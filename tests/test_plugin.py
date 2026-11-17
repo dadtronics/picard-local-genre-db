@@ -180,6 +180,7 @@ def test_enable_registers_with_picard_api(plugin, settings, monkeypatch):
     api_module = types.ModuleType('picard.plugin3.api')
     api_module.OptionsPage = type('OptionsPage', (), {})
     api_module.BaseAction = type('BaseAction', (), {})
+    api_module.Album = type('Album', (), {})
     for name, module in {
         'PyQt6': qt, 'PyQt6.QtCore': qt.QtCore, 'PyQt6.QtWidgets': qt.QtWidgets,
         'picard': types.ModuleType('picard'), 'picard.plugin3': types.ModuleType('picard.plugin3'),
@@ -199,6 +200,7 @@ def test_enable_registers_with_picard_api(plugin, settings, monkeypatch):
     api.register_album_metadata_processor.assert_called_once()
     api.register_track_metadata_processor.assert_called_once()
     api.register_options_page.assert_called_once()
+    api.register_album_action.assert_called_once()
 
     md = album_metadata()
     album_processor = api.register_album_metadata_processor.call_args.args[0]

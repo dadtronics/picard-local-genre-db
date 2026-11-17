@@ -10,6 +10,8 @@ without Picard. The Qt parts (settings page, context-menu action) live in
 ``options.py`` and ``actions.py`` and are imported from ``enable()``.
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os
@@ -439,6 +441,145 @@ def append_pending(metadata, ids: dict, settings: Settings, path: str | None = N
 
 
 # --------------------------------------------------------------------------
+# Saving decisions from Picard (right-click action)
+# --------------------------------------------------------------------------
+
+# Same built-in aliases as picard-genre-db's manage_taxonomy.py.
+BUILTIN_GENRE_ALIASES = {
+    'hip hop': 'Rap',
+    'hip-hop': 'Rap',
+    'hiphop': 'Rap',
+    'electronica': 'Electronic',
+}
+
+
+class TaxonomyError(Exception):
+    """A decision can't be saved; the message is shown to the user."""
+
+
+def decision_target(ids: dict, scope: str) -> str:
+    """MBID a decision of this scope is keyed on, or '' if the album has none."""
+    if scope == 'artist':
+        artists = list(ids.get('album_artists', [])) or list(ids.get('track_artists', []))
+        return artists[0] if artists else ''
+    return ids.get(scope, '')
+
+
+def _resolve_genre(con, name: str):
+    row = con.execute('SELECT id, name FROM canonical_genre WHERE name = ?', (name,)).fetchone()
+    if row:
+        return row
+    row = con.execute(
+        '''
+        SELECT cg.id, cg.name
+        FROM alias_mapping am
+        JOIN canonical_genre cg ON cg.id = am.normalized_genre_id
+        WHERE am.raw_value = ?
+        ORDER BY am.confidence DESC, am.source_name
+        LIMIT 1
+        ''',
+        (name,),
+    ).fetchone()
+    if row:
+        return row
+    builtin = BUILTIN_GENRE_ALIASES.get(name.casefold())
+    if builtin:
+        return con.execute('SELECT id, name FROM canonical_genre WHERE name = ?', (builtin,)).fetchone()
+    return None
+
+
+def _resolve_style(con, name: str):
+    row = con.execute('SELECT name FROM canonical_style WHERE name = ?', (name,)).fetchone()
+    if row:
+        return row[0]
+    try:
+        row = con.execute(
+            '''
+            SELECT cs.name
+            FROM style_alias_mapping sam
+            JOIN canonical_style cs ON cs.id = sam.normalized_style_id
+            WHERE sam.raw_value = ?
+            ''',
+            (name,),
+        ).fetchone()
+    except Exception:  # older databases without style aliases
+        row = None
+    return row[0] if row else None
+
+
+def save_decision(db_path: str, scope: str, mbid: str, genres: str, styles: str,
+                  notes: str = 'Saved from Picard') -> dict:
+    """Insert or update a decision, like the web app does.
+
+    Genres and styles must already exist in the taxonomy (canonical names or
+    aliases); unknown values raise TaxonomyError instead of inventing new
+    canonical entries. Returns the canonical genres/styles that were saved.
+    """
+    import sqlite3
+
+    if scope not in DECISION_TABLES:
+        raise TaxonomyError(f'Unknown scope: {scope}')
+    if not mbid:
+        raise TaxonomyError(f'This album has no {scope.replace("_", " ")} MBID.')
+    genre_names = split_semicolon(genres.replace(',', ';'))
+    if not genre_names:
+        raise TaxonomyError('The album has no genre to save.')
+    if not os.path.exists(db_path):
+        raise TaxonomyError(f'Database not found: {db_path}')
+
+    table, id_column, _ = DECISION_TABLES[scope]
+    # timeout = SQLite busy timeout, so a write while the web app is busy waits
+    # instead of failing.
+    con = sqlite3.connect(db_path, timeout=10)
+    try:
+        resolved, unknown = [], []
+        for name in genre_names:
+            row = _resolve_genre(con, name)
+            if row is None:
+                unknown.append(name)
+            elif row[1].casefold() not in (r[1].casefold() for r in resolved):
+                resolved.append(row)
+        canonical_styles, unknown_styles = [], []
+        for name in split_semicolon(styles.replace(',', ';')):
+            style = _resolve_style(con, name)
+            if style is None:
+                unknown_styles.append(name)
+            elif style.casefold() not in (s.casefold() for s in canonical_styles):
+                canonical_styles.append(style)
+        problems = []
+        if unknown:
+            problems.append('unknown genre(s): ' + ', '.join(unknown))
+        if unknown_styles:
+            problems.append('unknown style(s): ' + ', '.join(unknown_styles))
+        if problems:
+            raise TaxonomyError(
+                'Not saved: ' + '; '.join(problems) +
+                '. Add them in the picard-genre-db web app first, or fix the tags.')
+
+        genres_text = '; '.join(r[1] for r in resolved)
+        styles_text = '; '.join(canonical_styles)
+        with con:
+            con.execute(
+                f'''
+                INSERT INTO {table}(
+                    {id_column}, normalized_genre_id, genres_text, styles_text, notes, locked
+                ) VALUES (?, ?, ?, ?, ?, 1)
+                ON CONFLICT({id_column}) DO UPDATE SET
+                    normalized_genre_id=excluded.normalized_genre_id,
+                    genres_text=excluded.genres_text,
+                    styles_text=excluded.styles_text,
+                    notes=excluded.notes,
+                    locked=excluded.locked,
+                    updated_at=CURRENT_TIMESTAMP
+                ''',
+                (mbid, resolved[0][0], genres_text, styles_text, notes),
+            )
+        return {'scope': scope, 'mbid': mbid, 'genres': genres_text, 'styles': styles_text}
+    finally:
+        con.close()
+
+
+# --------------------------------------------------------------------------
 # Picard entry points
 # --------------------------------------------------------------------------
 
@@ -490,8 +631,10 @@ def enable(api) -> None:
     api.register_album_metadata_processor(_process_album)
     api.register_track_metadata_processor(_process_track)
 
+    from .actions import SaveGenreAction
     from .options import LocalGenreDbOptionsPage
     api.register_options_page(LocalGenreDbOptionsPage)
+    api.register_album_action(SaveGenreAction)
 
     log.info('Local Genre DB: %s', describe_taxonomy(Settings.from_config(api.plugin_config)))
 

@@ -9,14 +9,30 @@ from PyQt6 import QtCore, QtWidgets
 
 from . import DEFAULTS, LEARN_SCOPES, Settings, describe_taxonomy
 
-_CHECKBOXES = (
-    ('overwrite_with_decisions', 'Decisions overwrite existing genre/grouping tags'),
-    ('overwrite_existing', 'Alias matches overwrite existing tags too'),
-    ('write_grouping_tag', 'Write styles to the Grouping tag'),
-    ('write_style_tag', 'Write styles to a Style tag'),
-    ('remove_duplicate_style_tag', 'Remove a Style tag that duplicates the styles'),
-    ('learn_from_metadata', 'Remember genre/grouping of unmatched albums as pending decisions'),
+# (setting, label, tooltip), grouped as on the page.
+_TAGGING = (
+    ('overwrite_with_decisions', 'Decisions replace existing Genre and Grouping',
+     'A decision from your database (recording, release, release group or artist) wins over '
+     "MusicBrainz genres and whatever is already in the file."),
+    ('overwrite_existing', 'Alias matches replace existing tags too',
+     'Off: alias mappings only fill empty Genre/Grouping. On: they overwrite them.'),
+    ('write_grouping_tag', 'Write styles to Grouping',
+     'Grouping is the style tag this workflow uses; most players can show it.'),
 )
+_LEGACY_STYLE = (
+    ('write_style_tag', 'Also write styles to a separate Style tag',
+     'Style is a non-standard tag (saved as a custom field) that few players read. '
+     'Off since May 2026: styles go to Grouping only.'),
+    ('remove_duplicate_style_tag', 'Remove an old Style tag when it just repeats Grouping',
+     'Cleans up files tagged by early versions that wrote both. Only removes Style when it '
+     'matches the styles being written.'),
+)
+_SCOPE_LABELS = {
+    'release_group': 'Release group (all editions of the album)',
+    'release': 'Release (this edition only)',
+    'artist': 'Album artist',
+    'recording': 'Recording (single track)',
+}
 
 
 class LocalGenreDbOptionsPage(OptionsPage):
@@ -33,6 +49,7 @@ class LocalGenreDbOptionsPage(OptionsPage):
         self.json_edit = self._path_row(form, 'JSON snapshot (optional):', 'JSON (*.json);;All files (*)')
         self.status_label = QtWidgets.QLabel()
         self.status_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.status_label.setWordWrap(True)
         check_button = QtWidgets.QPushButton('Check')
         check_button.clicked.connect(self._update_status)
         status_row = QtWidgets.QHBoxLayout()
@@ -42,25 +59,46 @@ class LocalGenreDbOptionsPage(OptionsPage):
         hint = QtWidgets.QLabel(
             'Leave empty to use the PICARD_TAXONOMY_DB / PICARD_TAXONOMY_JSON environment '
             'variables or taxonomy_path.txt / taxonomy_json_path.txt pointer files.')
+        hint.setWordWrap(True)
         form.addRow(hint)
         layout.addWidget(files)
 
-        behaviour = QtWidgets.QGroupBox('Tagging')
-        box = QtWidgets.QVBoxLayout(behaviour)
         self.checkboxes = {}
-        for name, label in _CHECKBOXES:
-            checkbox = QtWidgets.QCheckBox(label)
-            box.addWidget(checkbox)
-            self.checkboxes[name] = checkbox
+        layout.addWidget(self._checkbox_group('Tagging', _TAGGING))
+
+        pending = QtWidgets.QGroupBox('Pending decisions')
+        box = QtWidgets.QVBoxLayout(pending)
+        learn = self._checkbox(
+            'learn_from_metadata', 'Remember unmatched albums that already have Genre and Grouping',
+            'Written to local_genre_db_pending.jsonl in the Plugins folder; review and import them '
+            'in the picard-genre-db web app.')
+        box.addWidget(learn)
         scope_row = QtWidgets.QHBoxLayout()
-        scope_row.addWidget(QtWidgets.QLabel('Pending decisions are saved per:'))
+        scope_row.addWidget(QtWidgets.QLabel('Save them as decisions for:'))
         self.scope_combo = QtWidgets.QComboBox()
-        self.scope_combo.addItems(LEARN_SCOPES)
+        for scope in LEARN_SCOPES:
+            self.scope_combo.addItem(_SCOPE_LABELS[scope], scope)
         scope_row.addWidget(self.scope_combo)
         scope_row.addStretch(1)
         box.addLayout(scope_row)
-        layout.addWidget(behaviour)
+        learn.toggled.connect(self.scope_combo.setEnabled)
+        layout.addWidget(pending)
+
+        layout.addWidget(self._checkbox_group('Style tag (legacy)', _LEGACY_STYLE))
         layout.addStretch(1)
+
+    def _checkbox(self, name, label, tooltip):
+        checkbox = QtWidgets.QCheckBox(label)
+        checkbox.setToolTip(tooltip)
+        self.checkboxes[name] = checkbox
+        return checkbox
+
+    def _checkbox_group(self, title, items):
+        group = QtWidgets.QGroupBox(title)
+        box = QtWidgets.QVBoxLayout(group)
+        for name, label, tooltip in items:
+            box.addWidget(self._checkbox(name, label, tooltip))
+        return group
 
     def _path_row(self, form, label, file_filter):
         edit = QtWidgets.QLineEdit()
@@ -86,7 +124,7 @@ class LocalGenreDbOptionsPage(OptionsPage):
         values = {name: checkbox.isChecked() for name, checkbox in self.checkboxes.items()}
         values['db_path'] = self.db_edit.text().strip()
         values['json_path'] = self.json_edit.text().strip()
-        values['learn_default_scope'] = self.scope_combo.currentText()
+        values['learn_default_scope'] = self.scope_combo.currentData()
         return Settings(**values)
 
     def _update_status(self):
@@ -98,8 +136,11 @@ class LocalGenreDbOptionsPage(OptionsPage):
         self.json_edit.setText(settings.json_path)
         for name, checkbox in self.checkboxes.items():
             checkbox.setChecked(getattr(settings, name))
-        scope = settings.learn_default_scope
-        self.scope_combo.setCurrentText(scope if scope in LEARN_SCOPES else DEFAULTS['learn_default_scope'])
+        index = self.scope_combo.findData(settings.learn_default_scope)
+        if index < 0:
+            index = self.scope_combo.findData(DEFAULTS['learn_default_scope'])
+        self.scope_combo.setCurrentIndex(index)
+        self.scope_combo.setEnabled(settings.learn_from_metadata)
         self._update_status()
 
     def save(self):

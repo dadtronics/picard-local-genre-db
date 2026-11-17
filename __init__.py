@@ -29,10 +29,10 @@ DEFAULTS = {
     'write_grouping_tag': True,
     'remove_duplicate_style_tag': True,
     'learn_from_metadata': True,
-    'learn_default_scope': 'artist',
+    'learn_default_scope': 'release_group',
 }
 
-LEARN_SCOPES = ('artist', 'release_group', 'release', 'recording')
+LEARN_SCOPES = ('release_group', 'release', 'artist', 'recording')
 
 DECISION_TABLES = {
     # scope: (table, id column, snapshot key)
@@ -57,7 +57,7 @@ class Settings:
     write_grouping_tag: bool = True
     remove_duplicate_style_tag: bool = True
     learn_from_metadata: bool = True
-    learn_default_scope: str = 'artist'
+    learn_default_scope: str = 'release_group'
 
     @classmethod
     def from_config(cls, config) -> Settings:

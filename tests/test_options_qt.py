@@ -40,7 +40,12 @@ def test_options_page_round_trip(qt_app, plugin, settings, monkeypatch):
     assert '1 release groups' in page.status_label.text()
 
     page.checkboxes['write_style_tag'].setChecked(True)
-    page.scope_combo.setCurrentText('release_group')
+    assert page.scope_combo.currentData() == 'release_group'  # default
+    assert set(page.checkboxes) == {n for n, d in plugin.DEFAULTS.items() if isinstance(d, bool)}
+    page.scope_combo.setCurrentIndex(page.scope_combo.findData('artist'))
     page.save()
     assert config['write_style_tag'] is True
-    assert config['learn_default_scope'] == 'release_group'
+    assert config['learn_default_scope'] == 'artist'
+
+    page.checkboxes['learn_from_metadata'].setChecked(False)
+    assert not page.scope_combo.isEnabled()

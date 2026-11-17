@@ -134,14 +134,25 @@ def test_lookup_does_not_lock_or_modify_db(plugin, settings, db, plugin_dir):
 # -- pending decisions and the plugin folder --------------------------------
 
 def test_pending_goes_to_plugins_folder_not_checkout(plugin, settings, plugin_dir):
-    md = {'musicbrainz_albumartistid': 'unknown-artist', 'genre': 'Shoegaze', 'grouping': 'Dream Pop'}
+    md = {'musicbrainz_releasegroupid': 'rg-new', 'musicbrainz_albumartistid': 'unknown-artist',
+          'genre': 'Shoegaze', 'grouping': 'Dream Pop'}
     plugin.process_metadata(md, 'release', settings, str(plugin_dir))
     pending = plugin_dir.parent / 'local_genre_db_pending.jsonl'
     row = json.loads(pending.read_text().splitlines()[0])
-    assert (row['scope'], row['mbid']) == ('artist', 'unknown-artist')
+    # Default scope is release group, like the web app's decision form.
+    assert (row['scope'], row['mbid']) == ('release_group', 'rg-new')
     # Picard refuses to update a checkout with untracked files.
     shipped = sorted(p.name for p in REPO.glob('*.py'))
     assert sorted(p.name for p in plugin_dir.iterdir() if p.name != '__pycache__') == shipped
+
+
+def test_learning_scope_setting(plugin, db, plugin_dir):
+    settings = plugin.Settings(db_path=str(db), learn_default_scope='artist')
+    md = {'musicbrainz_releasegroupid': 'rg-new', 'musicbrainz_albumartistid': 'unknown-artist',
+          'genre': 'Shoegaze', 'grouping': 'Dream Pop'}
+    plugin.process_metadata(md, 'release', settings, str(plugin_dir))
+    row = json.loads((plugin_dir.parent / 'local_genre_db_pending.jsonl').read_text().splitlines()[0])
+    assert (row['scope'], row['mbid']) == ('artist', 'unknown-artist')
 
 
 def test_learning_can_be_disabled(plugin, db, plugin_dir):
